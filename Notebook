@@ -6,46 +6,47 @@
 #   - eciscor_prod.information_schema.column_lineage (your populated view over system.access.column_lineage)
 #   - system.information_schema.tables / views       (object metadata + view SQL text)
 #
-# Outputs:
-#   - df_table_lineage_bidir  : table-level edges (UPSTREAM/DOWNSTREAM)
-#   - df_column_lineage_bidir : column-level edges (UPSTREAM/DOWNSTREAM)
-#   - df_table_graph_up       : nested upstream for each target table
-#   - df_table_graph_down     : nested downstream for each source table
-#   - df_column_graph_up      : nested upstream for each (target_table, target_column)
-#   - df_column_graph_down    : nested downstream for each (source_table, source_column)
+# Outputs (written as **managed tables** under eciscor_prod.cdo, prefixed with JWTest_):
+#   - eciscor_prod.cdo.JWTest_table_lineage_bidir
+#   - eciscor_prod.cdo.JWTest_column_lineage_bidir
+#   - eciscor_prod.cdo.JWTest_table_graph_up
+#   - eciscor_prod.cdo.JWTest_table_graph_down
+#   - eciscor_prod.cdo.JWTest_column_graph_up
+#   - eciscor_prod.cdo.JWTest_column_graph_down
 #
 # Notes:
-#   - Minimal widgets; "inputs are variables" as requested.
+#   - Minimal "inputs as variables" design per request.
 #   - Masked/unknown objects/columns are surfaced as Masked_Object_N / Masked_Column_N (never hidden).
-#   - DESCRIBE HISTORY is only used as a fallback when lineage write-time is missing.
-#   - Designed to be efficient on wide/deep graphs (broadcast frontier BFS, AQE/skew, persisted frames).
+#   - Uses only safe PySpark APIs—no sparkContext/_jvm/_jc access (compatible with shared clusters).
+#   - Efficient BFS with broadcast frontier; persisted DataFrames to stabilize memory.
 # -----------------------------------------------------------------------------------------------
 
 # =========================
 # CONFIG (edit these)
 # =========================
 BASE_FQN              = "main.default.my_table"       # catalog.schema.table (3-level name)
-MAX_HOPS              = 50                             # sane default for deep DAGs
+MAX_HOPS              = 50                             # reasonable default for deep DAGs
 LOOKBACK_DAYS         = 3650                           # lineage window (days)
 
-LINEAGE_CS            = "eciscor_prod.information_schema"  # where your lineage views live
-META_CATALOG          = "system"                            # for INFORMATION_SCHEMA across catalogs
+# Lineage view locations (your environment)
+LINEAGE_CS            = "eciscor_prod.information_schema"
+META_CATALOG          = "system"  # for cross-catalog INFORMATION_SCHEMA
 
-# Persist outputs as Delta tables (catalog.schema.table)
+# Persist outputs as **managed** Delta tables under eciscor_prod.cdo with JWTest_ prefix
 SAVE_OUTPUTS          = True
-OUT_TBL_TABLE_EDGES   = "main.lineage.table_lineage_bidir"
-OUT_TBL_COLUMN_EDGES  = "main.lineage.column_lineage_bidir"
-OUT_TBL_TGRAPH_UP     = "main.lineage.table_graph_up"
-OUT_TBL_TGRAPH_DOWN   = "main.lineage.table_graph_down"
-OUT_TBL_CGRAPH_UP     = "main.lineage.column_graph_up"
-OUT_TBL_CGRAPH_DOWN   = "main.lineage.column_graph_down"
+OUT_TBL_TABLE_EDGES   = "eciscor_prod.cdo.JWTest_table_lineage_bidir"
+OUT_TBL_COLUMN_EDGES  = "eciscor_prod.cdo.JWTest_column_lineage_bidir"
+OUT_TBL_TGRAPH_UP     = "eciscor_prod.cdo.JWTest_table_graph_up"
+OUT_TBL_TGRAPH_DOWN   = "eciscor_prod.cdo.JWTest_table_graph_down"
+OUT_TBL_CGRAPH_UP     = "eciscor_prod.cdo.JWTest_column_graph_up"
+OUT_TBL_CGRAPH_DOWN   = "eciscor_prod.cdo.JWTest_column_graph_down"
 
 # Optional file exports to a UC Volume (edges only by default)
 EXPORT_FILES          = False
 VOLUME_BASE_PATH      = "/Volumes/main/lineage_exports/lineage"  # UC Volume path
 EXPORT_FORMAT         = "parquet"            # "parquet" | "csv" | "json"
 EXPORT_COALESCE       = 1                    # 1 = single file per dataset; increase for very large outputs
-WRITE_GRAPHML         = False                # also write GraphML (.graphml) via NetworkX (driver memory sensitive)
+WRITE_GRAPHML         = False                # also write GraphML (.graphml) via NetworkX (driver-memory sensitive)
 GRAPHML_EDGE_LIMIT    = 400000               # safety limit when exporting to GraphML
 
 # =========================
@@ -56,10 +57,10 @@ from pyspark import StorageLevel
 
 assert len(BASE_FQN.split(".")) == 3, "BASE_FQN must be 3-level: catalog.schema.table"
 
-# Performance: rely on AQE + skew; broadcast only where we intend
+# Performance: rely on AQE + skew; DO NOT access spark.sparkContext on shared clusters
 spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
-spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
-spark.conf.set("spark.sql.shuffle.partitions", max(200, spark.sparkContext.defaultParallelism * 4))
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)  # we'll broadcast only the tiny frontier
+spark.conf.set("spark.sql.shuffle.partitions", 400)         # static, safe default for shared clusters
 
 # =========================
 # Helpers
@@ -90,7 +91,7 @@ def info_schema_views_df():
 def last_data_update_from_history(table_list):
     """For each table in table_list, return most recent data-modifying operation timestamp via DESCRIBE HISTORY."""
     rows = []
-    for fqn in sorted(set(t for t in table_list if t is not None and "." in t)):
+    for fqn in sorted(set(t for t in table_list if t and "." in t)):
         ts, op = None, None
         try:
             hist = spark.sql(f"DESCRIBE HISTORY {fqn}")
@@ -105,12 +106,12 @@ def last_data_update_from_history(table_list):
         rows.append((fqn, ts, op))
     return spark.createDataFrame(rows, "table_full_name string, history_ts timestamp, history_op string")
 
-def safe_split_fqn(col):
-    """Return (catalog,schema,table) with nulls for non-3-part names (e.g., Masked_Object_N)."""
-    cat = F.when(F.col(col).rlike(r'^[^.]+\.[^.]+\.[^.]+$'), F.split(F.col(col), r'\.')[0])
-    sch = F.when(F.col(col).rlike(r'^[^.]+\.[^.]+\.[^.]+$'), F.split(F.col(col), r'\.')[1])
-    nam = F.when(F.col(col).rlike(r'^[^.]+\.[^.]+\.[^.]+$'), F.split(F.col(col), r'\.')[2])
-    return cat.alias(f"{col}_catalog"), sch.alias(f"{col}_schema"), nam.alias(f"{col}_name")
+def safe_split_fqn(colname: str):
+    """Return Column exprs for (catalog,schema,table) only when name is truly 3-part."""
+    cat = F.when(F.col(colname).rlike(r'^[^.]+\.[^.]+\.[^.]+$'), F.split(F.col(colname), r'\.')[0])
+    sch = F.when(F.col(colname).rlike(r'^[^.]+\.[^.]+\.[^.]+$'), F.split(F.col(colname), r'\.')[1])
+    nam = F.when(F.col(colname).rlike(r'^[^.]+\.[^.]+\.[^.]+$'), F.split(F.col(colname), r'\.')[2])
+    return cat, sch, nam
 
 def create_schema_if_needed(full_name: str):
     cat_sch = full_name.rsplit(".",1)[0]
@@ -124,19 +125,6 @@ def write_df(df, fmt: str, path: str, coalesce_n: int = 1):
         out.write.mode("overwrite").json(path)
     else:
         out.write.mode("overwrite").parquet(path)
-
-# Build a deterministic mask placeholder for NULL/unknown objects/columns
-def mask_name_col(side_prefix: str, as_key_cols: list, label_prefix: str):
-    """
-    side_prefix : 'SRC' or 'TGT' or 'COLSRC'/'COLTGT'
-    as_key_cols : list of string columns to hash
-    label_prefix: 'Masked_Object_' or 'Masked_Column_'
-    Returns (mask_key_expr, mask_label_expr_after_rank_join)
-    """
-    concat_expr = F.concat_ws("|", F.lit(side_prefix), *[F.coalesce(F.col(c).cast("string"), F.lit("")) for c in as_key_cols])
-    key_expr = F.sha2(concat_expr, 256)
-    # label comes from later dense_rank mapping join; here we only return the key_expr
-    return key_expr
 
 # =========================
 # Read lineage views (partition-pruned)
@@ -237,7 +225,7 @@ for _i in range(MAX_HOPS):
     if frontier_dn.rdd.isEmpty(): break
     visited_dn = visited_dn.unionByName(frontier_dn)
 
-# Normalize UPSTREAM/DOWNSTREAM to a single edge set (with direction)
+# Normalize UPSTREAM/DOWNSTREAM to a single table-edge set (with direction)
 tbl_up_norm = (edges_tbl_up
   .withColumn("direction", F.lit("UPSTREAM"))
   .withColumn("source_table", F.col("parent_table"))
@@ -374,19 +362,7 @@ df_column_lineage_bidir = (col_up_norm.unionByName(col_dn_norm, allowMissingColu
 # =========================
 # MASK unknown/NULL objects & columns (never hide them)
 # =========================
-# Table masks
-src_mask_key = mask_name_col(
-    "SRC",
-    ["entity_id","entity_run_id","created_by","source_type","target_type", F.date_format(F.col("event_time"), "yyyy-MM-dd HH:mm:ss").alias("event_time_str")._jc.toString()],
-    "Masked_Object_"
-)  # key expr only; label added after rank mapping
-
-tgt_mask_key = mask_name_col(
-    "TGT",
-    ["entity_id","entity_run_id","created_by","source_type","target_type", F.date_format(F.col("event_time"), "yyyy-MM-dd HH:mm:ss").alias("event_time_str")._jc.toString()],
-    "Masked_Object_"
-)
-
+# Deterministic keys -> Masked_Object_N / Masked_Column_N
 df_table_lineage_bidir = (
     df_table_lineage_bidir
     .withColumn("src_mask_key", F.when(F.col("source_table").isNull(), 
@@ -417,14 +393,12 @@ mask_keys_tbl = (
     .union(df_table_lineage_bidir.select(F.col("tgt_mask_key").alias("mask_key")).where(F.col("mask_key").isNotNull()))
     .distinct()
 )
-
 w = Window.orderBy("mask_key")
 mask_map_tbl = (
     mask_keys_tbl
     .withColumn("mask_idx", F.dense_rank().over(w) - 1)
     .withColumn("mask_label", F.concat(F.lit("Masked_Object_"), F.col("mask_idx")))
 )
-
 df_table_lineage_bidir = (
     df_table_lineage_bidir
     .join(mask_map_tbl.withColumnRenamed("mask_key","src_mask_key").withColumnRenamed("mask_label","src_mask_label"), "src_mask_key", "left")
@@ -436,7 +410,6 @@ df_table_lineage_bidir = (
     .drop("src_mask_key","tgt_mask_key","src_mask_label","tgt_mask_label")
 )
 
-# Column masks
 df_column_lineage_bidir = (
     df_column_lineage_bidir
     .withColumn("src_col_mask_key", F.when(F.col("source_column").isNull(),
@@ -497,16 +470,15 @@ last_write_from_lineage = (
     .agg(F.max("event_time").alias("lineage_last_write_ts"))
 )
 
-# discovered tables for history fallback
-discovered_tables = (
+# discovered tables for history fallback (only valid 3-part names)
+discovered_tables_df = (
     df_table_lineage_bidir
-    .select("source_table").union(df_table_lineage_bidir.select("target_table"))
-    .where(F.col("source_table").rlike(r'^[^.]+\.[^.]+\.[^.]+$') | F.col("target_table").rlike(r'^[^.]+\.[^.]+\.[^.]+$'))
-    .select(F.coalesce("source_table","target_table").alias("t"))
+    .select(F.col("source_table").alias("t"))
+    .union(df_table_lineage_bidir.select(F.col("target_table").alias("t")))
+    .where(F.col("t").rlike(r'^[^.]+\.[^.]+\.[^.]+$'))
     .distinct()
-    .collect()
 )
-table_list = [r.t for r in discovered_tables] + [BASE_FQN]
+table_list = [r.t for r in discovered_tables_df.collect()] + [BASE_FQN]
 history_updates = last_data_update_from_history(table_list)
 
 last_update = (
@@ -527,8 +499,12 @@ tgt_cat, tgt_sch, tgt_nam = safe_split_fqn("target_table")
 # ----- TABLE EDGES enriched -----
 df_table_lineage_bidir = (
     df_table_lineage_bidir
-    .withColumns({"src_catalog": src_cat, "src_schema": src_sch, "src_name": src_nam,
-                  "tgt_catalog": tgt_cat, "tgt_schema": tgt_sch, "tgt_name": tgt_nam})
+    .withColumn("src_catalog", src_cat)
+    .withColumn("src_schema",  src_sch)
+    .withColumn("src_name",    src_nam)
+    .withColumn("tgt_catalog", tgt_cat)
+    .withColumn("tgt_schema",  tgt_sch)
+    .withColumn("tgt_name",    tgt_nam)
     # table types
     .join(tbl_info.alias("tis"),
           (F.col("tis.catalog")==F.lower("src_catalog")) &
@@ -576,8 +552,12 @@ df_table_lineage_bidir = (
 # ----- COLUMN EDGES enriched -----
 df_column_lineage_bidir = (
     df_column_lineage_bidir
-    .withColumns({"src_catalog": src_cat, "src_schema": src_sch, "src_name": src_nam,
-                  "tgt_catalog": tgt_cat, "tgt_schema": tgt_sch, "tgt_name": tgt_nam})
+    .withColumn("src_catalog", src_cat)
+    .withColumn("src_schema",  src_sch)
+    .withColumn("src_name",    src_nam)
+    .withColumn("tgt_catalog", tgt_cat)
+    .withColumn("tgt_schema",  tgt_sch)
+    .withColumn("tgt_name",    tgt_nam)
     # table types for context
     .join(tbl_info.alias("tis"),
           (F.col("tis.catalog")==F.lower("src_catalog")) &
@@ -689,7 +669,7 @@ display(df_column_graph_up)
 display(df_column_graph_down)
 
 # =========================
-# Save Delta tables (optional)
+# Save Delta tables (managed, UC)
 # =========================
 if SAVE_OUTPUTS:
     for full in [OUT_TBL_TABLE_EDGES, OUT_TBL_COLUMN_EDGES, OUT_TBL_TGRAPH_UP, OUT_TBL_TGRAPH_DOWN, OUT_TBL_CGRAPH_UP, OUT_TBL_CGRAPH_DOWN]:
@@ -700,7 +680,7 @@ if SAVE_OUTPUTS:
     (df_table_graph_down.write.mode("overwrite").option("overwriteSchema","true").saveAsTable(OUT_TBL_TGRAPH_DOWN))
     (df_column_graph_up.write.mode("overwrite").option("overwriteSchema","true").saveAsTable(OUT_TBL_CGRAPH_UP))
     (df_column_graph_down.write.mode("overwrite").option("overwriteSchema","true").saveAsTable(OUT_TBL_CGRAPH_DOWN))
-    print("Saved lineage outputs.")
+    print("Saved lineage outputs to eciscor_prod.cdo (JWTest_*)")
 
 # =========================
 # File exports to UC Volume (optional)
