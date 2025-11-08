@@ -1,12 +1,12 @@
 # Databricks notebook source
-# DBR 15.4 LTS (Spark 3.5) | Unity Catalog on AWS
+# DBR 15.4 LTS (Spark 3.5) | Unity Catalog on AWS | Shared-cluster safe (no .rdd / no JVM access)
 # End-to-end upstream + downstream lineage (tables + columns), including views and last data update timestamps.
 # Sources:
 #   - eciscor_prod.information_schema.table_lineage  (your populated view over system.access.table_lineage)
 #   - eciscor_prod.information_schema.column_lineage (your populated view over system.access.column_lineage)
 #   - system.information_schema.tables / views       (object metadata + view SQL text)
 #
-# Outputs (written as **managed tables** under eciscor_prod.cdo, prefixed with JWTest_):
+# Outputs (written as managed tables under eciscor_prod.cdo, prefixed with JWTest_):
 #   - eciscor_prod.cdo.JWTest_table_lineage_bidir
 #   - eciscor_prod.cdo.JWTest_column_lineage_bidir
 #   - eciscor_prod.cdo.JWTest_table_graph_up
@@ -15,11 +15,10 @@
 #   - eciscor_prod.cdo.JWTest_column_graph_down
 #
 # Notes:
-#   - Minimal "inputs as variables" design per request.
+#   - Minimal "inputs as variables".
 #   - Masked/unknown objects/columns are surfaced as Masked_Object_N / Masked_Column_N (never hidden).
-#   - Uses only safe PySpark APIs—no sparkContext/_jvm/_jc access (compatible with shared clusters).
+#   - Uses only safe PySpark APIs — no .rdd, no sparkContext/_jvm access (compatible with shared clusters).
 #   - Efficient BFS with broadcast frontier; persisted DataFrames to stabilize memory.
-# -----------------------------------------------------------------------------------------------
 
 # =========================
 # CONFIG (edit these)
@@ -32,7 +31,7 @@ LOOKBACK_DAYS         = 3650                           # lineage window (days)
 LINEAGE_CS            = "eciscor_prod.information_schema"
 META_CATALOG          = "system"  # for cross-catalog INFORMATION_SCHEMA
 
-# Persist outputs as **managed** Delta tables under eciscor_prod.cdo with JWTest_ prefix
+# Persist outputs as managed Delta tables under eciscor_prod.cdo with JWTest_ prefix
 SAVE_OUTPUTS          = True
 OUT_TBL_TABLE_EDGES   = "eciscor_prod.cdo.JWTest_table_lineage_bidir"
 OUT_TBL_COLUMN_EDGES  = "eciscor_prod.cdo.JWTest_column_lineage_bidir"
@@ -57,14 +56,18 @@ from pyspark import StorageLevel
 
 assert len(BASE_FQN.split(".")) == 3, "BASE_FQN must be 3-level: catalog.schema.table"
 
-# Performance: rely on AQE + skew; DO NOT access spark.sparkContext on shared clusters
+# Performance: rely on AQE + skew; no RDD access for shared clusters
 spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
-spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)  # we'll broadcast only the tiny frontier
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)  # broadcast only the tiny frontier
 spark.conf.set("spark.sql.shuffle.partitions", 400)         # static, safe default for shared clusters
 
 # =========================
 # Helpers
 # =========================
+def df_is_empty(df) -> bool:
+    # Shared-cluster safe emptiness check (no .rdd)
+    return len(df.take(1)) == 0
+
 DATA_MODIFYING_OPS = {
     "WRITE","MERGE","UPDATE","DELETE","COPY INTO",
     "CREATE TABLE AS SELECT","REPLACE TABLE AS SELECT","CREATE OR REPLACE TABLE AS SELECT",
@@ -151,7 +154,8 @@ column_lineage = (
     ).persist(StorageLevel.MEMORY_AND_DISK)
 )
 
-_ = lineage_table.limit(1).count(); _ = column_lineage.limit(1).count()  # warm cache
+# Warm cache (no .rdd)
+_ = lineage_table.limit(1).count(); _ = column_lineage.limit(1).count()
 
 # =========================
 # TABLE lineage — UPSTREAM BFS
@@ -184,9 +188,9 @@ for _i in range(MAX_HOPS):
             .select(F.col("parent_table").alias("table_full_name"), "hop")
             .dropDuplicates(["table_full_name"])
     )
-    if next_frontier.rdd.isEmpty(): break
+    if df_is_empty(next_frontier): break
     frontier_up = next_frontier.alias("n").join(visited_up.alias("v"), "table_full_name", "left_anti")
-    if frontier_up.rdd.isEmpty(): break
+    if df_is_empty(frontier_up): break
     visited_up = visited_up.unionByName(frontier_up)
 
 # =========================
@@ -220,9 +224,9 @@ for _i in range(MAX_HOPS):
             .select(F.col("child_table").alias("table_full_name"), "hop")
             .dropDuplicates(["table_full_name"])
     )
-    if next_frontier.rdd.isEmpty(): break
+    if df_is_empty(next_frontier): break
     frontier_dn = next_frontier.alias("n").join(visited_dn.alias("v"), "table_full_name", "left_anti")
-    if frontier_dn.rdd.isEmpty(): break
+    if df_is_empty(frontier_dn): break
     visited_dn = visited_dn.unionByName(frontier_dn)
 
 # Normalize UPSTREAM/DOWNSTREAM to a single table-edge set (with direction)
@@ -266,7 +270,7 @@ frontier_up_cols = (
     .dropDuplicates(["t","c"])
 )
 for _i in range(2, MAX_HOPS+1):
-    if frontier_up_cols.rdd.isEmpty(): break
+    if df_is_empty(frontier_up_cols): break
     step = (
         column_lineage.alias("cl")
         .join(F.broadcast(frontier_up_cols.alias("fc")),
@@ -313,7 +317,7 @@ frontier_dn_cols = (
     .dropDuplicates(["t","c"])
 )
 for _i in range(2, MAX_HOPS+1):
-    if frontier_dn_cols.rdd.isEmpty(): break
+    if df_is_empty(frontier_dn_cols): break
     step = (
         column_lineage.alias("cl")
         .join(F.broadcast(frontier_dn_cols.alias("fc")),
@@ -713,7 +717,7 @@ if EXPORT_FILES:
             )
             Gc = nx.DiGraph()
             for r in col_pd.itertuples(index=False):
-                Gc.add_edge(r.src, r.tgt, hop=int(r.hop))
+                Gc.add_edge(r.src, r.tgt, hop:int(r.hop))
             nx.write_graphml(Gc, f"{localBase}/column_lineage.graphml")
             print(f"GraphML written under dbfs:{VOLUME_BASE_PATH.rstrip('/')}/{run_id}")
         except Exception as e:
