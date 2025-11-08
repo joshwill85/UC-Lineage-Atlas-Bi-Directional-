@@ -1,35 +1,28 @@
 # Databricks notebook source
 # DBR 15.4 LTS (Spark 3.5) | Unity Catalog on AWS | Shared-cluster safe (no .rdd / no JVM access)
-# End-to-end upstream + downstream lineage (tables + columns), including views and last data update timestamps.
+# Upstream + Downstream lineage (tables + columns), views support, and last data update timestamps.
 # Sources:
-#   - eciscor_prod.information_schema.table_lineage  (your populated view over system.access.table_lineage)
-#   - eciscor_prod.information_schema.column_lineage (your populated view over system.access.column_lineage)
-#   - system.information_schema.tables / views       (object metadata + view SQL text)
+#   - eciscor_prod.information_schema.table_lineage  (view over system.access.table_lineage)
+#   - eciscor_prod.information_schema.column_lineage (view over system.access.column_lineage)
+#   - system.information_schema.tables / views
 #
-# Outputs (written as managed tables under eciscor_prod.cdo, prefixed with JWTest_):
+# Outputs (managed tables under eciscor_prod.cdo, prefixed JWTest_):
 #   - eciscor_prod.cdo.JWTest_table_lineage_bidir
 #   - eciscor_prod.cdo.JWTest_column_lineage_bidir
 #   - eciscor_prod.cdo.JWTest_table_graph_up
 #   - eciscor_prod.cdo.JWTest_table_graph_down
 #   - eciscor_prod.cdo.JWTest_column_graph_up
 #   - eciscor_prod.cdo.JWTest_column_graph_down
-#
-# Notes:
-#   - Minimal "inputs as variables".
-#   - Masked/unknown objects/columns are surfaced as Masked_Object_N / Masked_Column_N (never hidden).
-#   - Uses only safe PySpark APIs — no .rdd, no sparkContext/_jvm access (compatible with shared clusters).
-#   - Efficient BFS with broadcast frontier; persisted DataFrames to stabilize memory.
 
 # =========================
 # CONFIG (edit these)
 # =========================
-BASE_FQN              = "main.default.my_table"       # catalog.schema.table (3-level name)
-MAX_HOPS              = 50                             # reasonable default for deep DAGs
-LOOKBACK_DAYS         = 3650                           # lineage window (days)
+BASE_FQN              = "main.default.my_table"       # catalog.schema.table (3-part)
+MAX_HOPS              = 50
+LOOKBACK_DAYS         = 3650
 
-# Lineage view locations (your environment)
-LINEAGE_CS            = "eciscor_prod.information_schema"
-META_CATALOG          = "system"  # for cross-catalog INFORMATION_SCHEMA
+LINEAGE_CS            = "eciscor_prod.information_schema"  # your lineage views
+META_CATALOG          = "system"                            # for INFORMATION_SCHEMA
 
 # Persist outputs as managed Delta tables under eciscor_prod.cdo with JWTest_ prefix
 SAVE_OUTPUTS          = True
@@ -40,13 +33,11 @@ OUT_TBL_TGRAPH_DOWN   = "eciscor_prod.cdo.JWTest_table_graph_down"
 OUT_TBL_CGRAPH_UP     = "eciscor_prod.cdo.JWTest_column_graph_up"
 OUT_TBL_CGRAPH_DOWN   = "eciscor_prod.cdo.JWTest_column_graph_down"
 
-# Optional file exports to a UC Volume (edges only by default)
+# Optional file exports (edges only by default) to a UC Volume
 EXPORT_FILES          = False
-VOLUME_BASE_PATH      = "/Volumes/main/lineage_exports/lineage"  # UC Volume path
+VOLUME_BASE_PATH      = "/Volumes/main/lineage_exports/lineage"
 EXPORT_FORMAT         = "parquet"            # "parquet" | "csv" | "json"
-EXPORT_COALESCE       = 1                    # 1 = single file per dataset; increase for very large outputs
-WRITE_GRAPHML         = False                # also write GraphML (.graphml) via NetworkX (driver-memory sensitive)
-GRAPHML_EDGE_LIMIT    = 400000               # safety limit when exporting to GraphML
+EXPORT_COALESCE       = 1
 
 # =========================
 # Imports & Spark knobs
@@ -56,17 +47,17 @@ from pyspark import StorageLevel
 
 assert len(BASE_FQN.split(".")) == 3, "BASE_FQN must be 3-level: catalog.schema.table"
 
-# Performance: rely on AQE + skew; no RDD access for shared clusters
+# Performance: AQE + skew; explicit broadcast of tiny frontiers; no .rdd anywhere
 spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
-spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)  # broadcast only the tiny frontier
-spark.conf.set("spark.sql.shuffle.partitions", 400)         # static, safe default for shared clusters
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
+spark.conf.set("spark.sql.shuffle.partitions", 400)
 
 # =========================
 # Helpers
 # =========================
 def df_is_empty(df) -> bool:
     # Shared-cluster safe emptiness check (no .rdd)
-    return len(df.take(1)) == 0
+    return df.limit(1).count() == 0
 
 DATA_MODIFYING_OPS = {
     "WRITE","MERGE","UPDATE","DELETE","COPY INTO",
@@ -83,7 +74,7 @@ def info_schema_tables_df():
     )
 
 def info_schema_views_df():
-    # VIEW_DEFINITION returned when you own the view; NULL otherwise (expected).
+    # VIEW_DEFINITION returned if you own the view; NULL otherwise.
     return spark.table(f"{META_CATALOG}.information_schema.views").select(
         F.lower("table_catalog").alias("catalog"),
         F.lower("table_schema").alias("schema"),
@@ -92,7 +83,7 @@ def info_schema_views_df():
     )
 
 def last_data_update_from_history(table_list):
-    """For each table in table_list, return most recent data-modifying operation timestamp via DESCRIBE HISTORY."""
+    """Return most recent *data-modifying* operation per table via DESCRIBE HISTORY."""
     rows = []
     for fqn in sorted(set(t for t in table_list if t and "." in t)):
         ts, op = None, None
@@ -110,7 +101,7 @@ def last_data_update_from_history(table_list):
     return spark.createDataFrame(rows, "table_full_name string, history_ts timestamp, history_op string")
 
 def safe_split_fqn(colname: str):
-    """Return Column exprs for (catalog,schema,table) only when name is truly 3-part."""
+    """Return Column exprs for (catalog,schema,table) only when truly 3-part."""
     cat = F.when(F.col(colname).rlike(r'^[^.]+\.[^.]+\.[^.]+$'), F.split(F.col(colname), r'\.')[0])
     sch = F.when(F.col(colname).rlike(r'^[^.]+\.[^.]+\.[^.]+$'), F.split(F.col(colname), r'\.')[1])
     nam = F.when(F.col(colname).rlike(r'^[^.]+\.[^.]+\.[^.]+$'), F.split(F.col(colname), r'\.')[2])
@@ -154,7 +145,7 @@ column_lineage = (
     ).persist(StorageLevel.MEMORY_AND_DISK)
 )
 
-# Warm cache (no .rdd)
+# Warm cache
 _ = lineage_table.limit(1).count(); _ = column_lineage.limit(1).count()
 
 # =========================
@@ -364,9 +355,8 @@ df_column_lineage_bidir = (col_up_norm.unionByName(col_dn_norm, allowMissingColu
 )
 
 # =========================
-# MASK unknown/NULL objects & columns (never hide them)
+# MASK unknown/NULL objects & columns (explicit placeholders)
 # =========================
-# Deterministic keys -> Masked_Object_N / Masked_Column_N
 df_table_lineage_bidir = (
     df_table_lineage_bidir
     .withColumn("src_mask_key", F.when(F.col("source_table").isNull(), 
@@ -466,7 +456,7 @@ df_column_lineage_bidir = (
 tbl_info  = info_schema_tables_df()
 view_info = info_schema_views_df()
 
-# lineage-derived last write (fast path)
+# lineage-derived last write (fast)
 last_write_from_lineage = (
     lineage_table
     .where(F.col("target_table_full_name").isNotNull())
@@ -474,7 +464,7 @@ last_write_from_lineage = (
     .agg(F.max("event_time").alias("lineage_last_write_ts"))
 )
 
-# discovered tables for history fallback (only valid 3-part names)
+# discovered tables for history fallback (valid 3-part names)
 discovered_tables_df = (
     df_table_lineage_bidir
     .select(F.col("source_table").alias("t"))
@@ -503,25 +493,19 @@ tgt_cat, tgt_sch, tgt_nam = safe_split_fqn("target_table")
 # ----- TABLE EDGES enriched -----
 df_table_lineage_bidir = (
     df_table_lineage_bidir
-    .withColumn("src_catalog", src_cat)
-    .withColumn("src_schema",  src_sch)
-    .withColumn("src_name",    src_nam)
-    .withColumn("tgt_catalog", tgt_cat)
-    .withColumn("tgt_schema",  tgt_sch)
-    .withColumn("tgt_name",    tgt_nam)
+    .withColumn("src_catalog", src_cat).withColumn("src_schema",  src_sch).withColumn("src_name", src_nam)
+    .withColumn("tgt_catalog", tgt_cat).withColumn("tgt_schema",  tgt_sch).withColumn("tgt_name", tgt_nam)
     # table types
     .join(tbl_info.alias("tis"),
           (F.col("tis.catalog")==F.lower("src_catalog")) &
           (F.col("tis.schema")==F.lower("src_schema")) &
           (F.col("tis.table")==F.col("src_name")), "left")
-    .withColumnRenamed("table_type","source_table_type") \
-    .withColumnRenamed("last_altered","source_last_altered") \
+    .withColumnRenamed("table_type","source_table_type").withColumnRenamed("last_altered","source_last_altered")
     .join(tbl_info.alias("tit"),
           (F.col("tit.catalog")==F.lower("tgt_catalog")) &
           (F.col("tit.schema")==F.lower("tgt_schema")) &
           (F.col("tit.table")==F.col("tgt_name")), "left")
-    .withColumnRenamed("table_type","target_table_type") \
-    .withColumnRenamed("last_altered","target_last_altered")
+    .withColumnRenamed("table_type","target_table_type").withColumnRenamed("last_altered","target_last_altered")
     # view SQL
     .join(view_info.alias("vis"),
           (F.col("vis.catalog")==F.lower("src_catalog")) &
@@ -556,13 +540,9 @@ df_table_lineage_bidir = (
 # ----- COLUMN EDGES enriched -----
 df_column_lineage_bidir = (
     df_column_lineage_bidir
-    .withColumn("src_catalog", src_cat)
-    .withColumn("src_schema",  src_sch)
-    .withColumn("src_name",    src_nam)
-    .withColumn("tgt_catalog", tgt_cat)
-    .withColumn("tgt_schema",  tgt_sch)
-    .withColumn("tgt_name",    tgt_nam)
-    # table types for context
+    .withColumn("src_catalog", src_cat).withColumn("src_schema",  src_sch).withColumn("src_name", src_nam)
+    .withColumn("tgt_catalog", tgt_cat).withColumn("tgt_schema",  tgt_sch).withColumn("tgt_name", tgt_nam)
+    # table types
     .join(tbl_info.alias("tis"),
           (F.col("tis.catalog")==F.lower("src_catalog")) &
           (F.col("tis.schema")==F.lower("src_schema")) &
@@ -573,7 +553,7 @@ df_column_lineage_bidir = (
           (F.col("tit.schema")==F.lower("tgt_schema")) &
           (F.col("tit.table")==F.col("tgt_name")), "left")
     .withColumnRenamed("table_type","target_table_type")
-    # last data update to parent/child tables (useful at column granularity)
+    # last data update (table-level context at column granularity)
     .join(last_update.select(F.col("table_full_name").alias("source_table"),
                              F.col("last_data_update_ts").alias("source_last_data_update_ts"),
                              F.col("last_data_update_op").alias("source_last_data_update_op")), "source_table","left")
@@ -690,35 +670,9 @@ if SAVE_OUTPUTS:
 # File exports to UC Volume (optional)
 # =========================
 if EXPORT_FILES:
-    import datetime as dt, os
+    import datetime as dt
     run_id    = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     sparkBase = f"dbfs:{VOLUME_BASE_PATH.rstrip('/')}/{run_id}"
-    localBase = f"/dbfs{VOLUME_BASE_PATH.rstrip('/')}/{run_id}"
     write_df(df_table_lineage_bidir,  EXPORT_FORMAT, f"{sparkBase}/table_edges_bidir",  EXPORT_COALESCE)
     write_df(df_column_lineage_bidir, EXPORT_FORMAT, f"{sparkBase}/column_edges_bidir", EXPORT_COALESCE)
     print(f"Exported edges to {sparkBase}")
-
-    if WRITE_GRAPHML:
-        try:
-            import networkx as nx
-            os.makedirs(localBase, exist_ok=True)
-            tbl_pd = df_table_lineage_bidir.select("source_table","target_table","hop").limit(GRAPHML_EDGE_LIMIT).toPandas()
-            Gt = nx.DiGraph()
-            for r in tbl_pd.itertuples(index=False):
-                Gt.add_edge(r.source_table, r.target_table, hop=int(r.hop))
-            nx.write_graphml(Gt, f"{localBase}/table_lineage.graphml")
-
-            col_pd = (
-                df_column_lineage_bidir
-                .select(F.concat_ws(".", "source_table","source_column").alias("src"),
-                        F.concat_ws(".", "target_table","target_column").alias("tgt"),
-                        "hop")
-                .limit(GRAPHML_EDGE_LIMIT).toPandas()
-            )
-            Gc = nx.DiGraph()
-            for r in col_pd.itertuples(index=False):
-                Gc.add_edge(r.src, r.tgt, hop:int(r.hop))
-            nx.write_graphml(Gc, f"{localBase}/column_lineage.graphml")
-            print(f"GraphML written under dbfs:{VOLUME_BASE_PATH.rstrip('/')}/{run_id}")
-        except Exception as e:
-            print(f"GraphML export skipped: {e}")
