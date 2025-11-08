@@ -1,0 +1,740 @@
+# Databricks notebook source
+# DBR 15.4 LTS (Spark 3.5) | Unity Catalog on AWS
+# End-to-end upstream + downstream lineage (tables + columns), including views and last data update timestamps.
+# Sources:
+#   - eciscor_prod.information_schema.table_lineage  (your populated view over system.access.table_lineage)
+#   - eciscor_prod.information_schema.column_lineage (your populated view over system.access.column_lineage)
+#   - system.information_schema.tables / views       (object metadata + view SQL text)
+#
+# Outputs:
+#   - df_table_lineage_bidir  : table-level edges (UPSTREAM/DOWNSTREAM)
+#   - df_column_lineage_bidir : column-level edges (UPSTREAM/DOWNSTREAM)
+#   - df_table_graph_up       : nested upstream for each target table
+#   - df_table_graph_down     : nested downstream for each source table
+#   - df_column_graph_up      : nested upstream for each (target_table, target_column)
+#   - df_column_graph_down    : nested downstream for each (source_table, source_column)
+#
+# Notes:
+#   - Minimal widgets; "inputs are variables" as requested.
+#   - Masked/unknown objects/columns are surfaced as Masked_Object_N / Masked_Column_N (never hidden).
+#   - DESCRIBE HISTORY is only used as a fallback when lineage write-time is missing.
+#   - Designed to be efficient on wide/deep graphs (broadcast frontier BFS, AQE/skew, persisted frames).
+# -----------------------------------------------------------------------------------------------
+
+# =========================
+# CONFIG (edit these)
+# =========================
+BASE_FQN              = "main.default.my_table"       # catalog.schema.table (3-level name)
+MAX_HOPS              = 50                             # sane default for deep DAGs
+LOOKBACK_DAYS         = 3650                           # lineage window (days)
+
+LINEAGE_CS            = "eciscor_prod.information_schema"  # where your lineage views live
+META_CATALOG          = "system"                            # for INFORMATION_SCHEMA across catalogs
+
+# Persist outputs as Delta tables (catalog.schema.table)
+SAVE_OUTPUTS          = True
+OUT_TBL_TABLE_EDGES   = "main.lineage.table_lineage_bidir"
+OUT_TBL_COLUMN_EDGES  = "main.lineage.column_lineage_bidir"
+OUT_TBL_TGRAPH_UP     = "main.lineage.table_graph_up"
+OUT_TBL_TGRAPH_DOWN   = "main.lineage.table_graph_down"
+OUT_TBL_CGRAPH_UP     = "main.lineage.column_graph_up"
+OUT_TBL_CGRAPH_DOWN   = "main.lineage.column_graph_down"
+
+# Optional file exports to a UC Volume (edges only by default)
+EXPORT_FILES          = False
+VOLUME_BASE_PATH      = "/Volumes/main/lineage_exports/lineage"  # UC Volume path
+EXPORT_FORMAT         = "parquet"            # "parquet" | "csv" | "json"
+EXPORT_COALESCE       = 1                    # 1 = single file per dataset; increase for very large outputs
+WRITE_GRAPHML         = False                # also write GraphML (.graphml) via NetworkX (driver memory sensitive)
+GRAPHML_EDGE_LIMIT    = 400000               # safety limit when exporting to GraphML
+
+# =========================
+# Imports & Spark knobs
+# =========================
+from pyspark.sql import functions as F, types as T, Window
+from pyspark import StorageLevel
+
+assert len(BASE_FQN.split(".")) == 3, "BASE_FQN must be 3-level: catalog.schema.table"
+
+# Performance: rely on AQE + skew; broadcast only where we intend
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
+spark.conf.set("spark.sql.shuffle.partitions", max(200, spark.sparkContext.defaultParallelism * 4))
+
+# =========================
+# Helpers
+# =========================
+DATA_MODIFYING_OPS = {
+    "WRITE","MERGE","UPDATE","DELETE","COPY INTO",
+    "CREATE TABLE AS SELECT","REPLACE TABLE AS SELECT","CREATE OR REPLACE TABLE AS SELECT",
+    "RESTORE","TRUNCATE","STREAMING UPDATE","DEEP CLONE","APPEND","INSERT"
+}
+
+def info_schema_tables_df():
+    return spark.table(f"{META_CATALOG}.information_schema.tables").select(
+        F.lower("table_catalog").alias("catalog"),
+        F.lower("table_schema").alias("schema"),
+        F.col("table_name").alias("table"),
+        "table_type","last_altered"
+    )
+
+def info_schema_views_df():
+    # VIEW_DEFINITION returned when you own the view; NULL otherwise (expected).
+    return spark.table(f"{META_CATALOG}.information_schema.views").select(
+        F.lower("table_catalog").alias("catalog"),
+        F.lower("table_schema").alias("schema"),
+        F.col("table_name").alias("table"),
+        F.col("view_definition")
+    )
+
+def last_data_update_from_history(table_list):
+    """For each table in table_list, return most recent data-modifying operation timestamp via DESCRIBE HISTORY."""
+    rows = []
+    for fqn in sorted(set(t for t in table_list if t is not None and "." in t)):
+        ts, op = None, None
+        try:
+            hist = spark.sql(f"DESCRIBE HISTORY {fqn}")
+            row = (hist.where(F.col("operation").isin(list(DATA_MODIFYING_OPS)))
+                        .orderBy(F.col("timestamp").desc())
+                        .select(F.col("timestamp").alias("ts"), "operation")
+                        .limit(1).collect())
+            if row:
+                ts, op = row[0]["ts"], row[0]["operation"]
+        except Exception:
+            pass
+        rows.append((fqn, ts, op))
+    return spark.createDataFrame(rows, "table_full_name string, history_ts timestamp, history_op string")
+
+def safe_split_fqn(col):
+    """Return (catalog,schema,table) with nulls for non-3-part names (e.g., Masked_Object_N)."""
+    cat = F.when(F.col(col).rlike(r'^[^.]+\.[^.]+\.[^.]+$'), F.split(F.col(col), r'\.')[0])
+    sch = F.when(F.col(col).rlike(r'^[^.]+\.[^.]+\.[^.]+$'), F.split(F.col(col), r'\.')[1])
+    nam = F.when(F.col(col).rlike(r'^[^.]+\.[^.]+\.[^.]+$'), F.split(F.col(col), r'\.')[2])
+    return cat.alias(f"{col}_catalog"), sch.alias(f"{col}_schema"), nam.alias(f"{col}_name")
+
+def create_schema_if_needed(full_name: str):
+    cat_sch = full_name.rsplit(".",1)[0]
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {cat_sch}")
+
+def write_df(df, fmt: str, path: str, coalesce_n: int = 1):
+    out = df if (coalesce_n is None or coalesce_n <= 0) else df.coalesce(coalesce_n)
+    if fmt == "csv":
+        out.write.mode("overwrite").option("header","true").csv(path)
+    elif fmt == "json":
+        out.write.mode("overwrite").json(path)
+    else:
+        out.write.mode("overwrite").parquet(path)
+
+# Build a deterministic mask placeholder for NULL/unknown objects/columns
+def mask_name_col(side_prefix: str, as_key_cols: list, label_prefix: str):
+    """
+    side_prefix : 'SRC' or 'TGT' or 'COLSRC'/'COLTGT'
+    as_key_cols : list of string columns to hash
+    label_prefix: 'Masked_Object_' or 'Masked_Column_'
+    Returns (mask_key_expr, mask_label_expr_after_rank_join)
+    """
+    concat_expr = F.concat_ws("|", F.lit(side_prefix), *[F.coalesce(F.col(c).cast("string"), F.lit("")) for c in as_key_cols])
+    key_expr = F.sha2(concat_expr, 256)
+    # label comes from later dense_rank mapping join; here we only return the key_expr
+    return key_expr
+
+# =========================
+# Read lineage views (partition-pruned)
+# =========================
+lineage_table = (
+    spark.read.table(f"{LINEAGE_CS}.table_lineage")
+    .where(F.col("event_date") >= F.date_sub(F.current_date(), LOOKBACK_DAYS))
+    .select(
+        "entity_type","entity_id","entity_run_id",
+        "source_table_full_name","source_type",
+        "target_table_full_name","target_type",
+        "created_by","event_time","event_date"
+    ).persist(StorageLevel.MEMORY_AND_DISK)
+)
+
+column_lineage = (
+    spark.read.table(f"{LINEAGE_CS}.column_lineage")
+    .where(F.col("event_date") >= F.date_sub(F.current_date(), LOOKBACK_DAYS))
+    .select(
+        "entity_type","entity_id","entity_run_id",
+        "source_table_full_name","source_column_name","source_type",
+        "target_table_full_name","target_column_name","target_type",
+        "created_by","event_time","event_date"
+    ).persist(StorageLevel.MEMORY_AND_DISK)
+)
+
+_ = lineage_table.limit(1).count(); _ = column_lineage.limit(1).count()  # warm cache
+
+# =========================
+# TABLE lineage — UPSTREAM BFS
+# =========================
+frontier_up = spark.createDataFrame([(BASE_FQN, 0)], "table_full_name string, hop int")
+visited_up  = frontier_up
+edges_tbl_up = spark.createDataFrame([], """
+  child_table string, parent_table string, hop int,
+  source_type string, target_type string, event_time timestamp, created_by string,
+  entity_type string, entity_id string, entity_run_id string
+""")
+
+for _i in range(MAX_HOPS):
+    step = (
+        lineage_table.alias("lt")
+        .join(F.broadcast(frontier_up.alias("f")),
+              F.col("lt.target_table_full_name")==F.col("f.table_full_name"), "inner")
+        .select(
+            F.col("lt.target_table_full_name").alias("child_table"),
+            F.col("lt.source_table_full_name").alias("parent_table"),
+            (F.col("f.hop")+F.lit(1)).alias("hop"),
+            F.col("lt.source_type"), F.col("lt.target_type"),
+            F.col("lt.event_time"), F.col("lt.created_by"),
+            F.col("lt.entity_type"), F.col("lt.entity_id"), F.col("lt.entity_run_id")
+        ).dropDuplicates(["child_table","parent_table","event_time"])
+    )
+    edges_tbl_up = edges_tbl_up.unionByName(step, allowMissingColumns=True)
+    next_frontier = (
+        step.where(F.col("parent_table").isNotNull())
+            .select(F.col("parent_table").alias("table_full_name"), "hop")
+            .dropDuplicates(["table_full_name"])
+    )
+    if next_frontier.rdd.isEmpty(): break
+    frontier_up = next_frontier.alias("n").join(visited_up.alias("v"), "table_full_name", "left_anti")
+    if frontier_up.rdd.isEmpty(): break
+    visited_up = visited_up.unionByName(frontier_up)
+
+# =========================
+# TABLE lineage — DOWNSTREAM BFS
+# =========================
+frontier_dn = spark.createDataFrame([(BASE_FQN, 0)], "table_full_name string, hop int")
+visited_dn  = frontier_dn
+edges_tbl_dn = spark.createDataFrame([], """
+  child_table string, parent_table string, hop int,
+  source_type string, target_type string, event_time timestamp, created_by string,
+  entity_type string, entity_id string, entity_run_id string
+""")
+
+for _i in range(MAX_HOPS):
+    step = (
+        lineage_table.alias("lt")
+        .join(F.broadcast(frontier_dn.alias("f")),
+              F.col("lt.source_table_full_name")==F.col("f.table_full_name"), "inner")
+        .select(
+            F.col("lt.target_table_full_name").alias("child_table"),
+            F.col("lt.source_table_full_name").alias("parent_table"),
+            (F.col("f.hop")+F.lit(1)).alias("hop"),
+            F.col("lt.source_type"), F.col("lt.target_type"),
+            F.col("lt.event_time"), F.col("lt.created_by"),
+            F.col("lt.entity_type"), F.col("lt.entity_id"), F.col("lt.entity_run_id")
+        ).dropDuplicates(["child_table","parent_table","event_time"])
+    )
+    edges_tbl_dn = edges_tbl_dn.unionByName(step, allowMissingColumns=True)
+    next_frontier = (
+        step.where(F.col("child_table").isNotNull())
+            .select(F.col("child_table").alias("table_full_name"), "hop")
+            .dropDuplicates(["table_full_name"])
+    )
+    if next_frontier.rdd.isEmpty(): break
+    frontier_dn = next_frontier.alias("n").join(visited_dn.alias("v"), "table_full_name", "left_anti")
+    if frontier_dn.rdd.isEmpty(): break
+    visited_dn = visited_dn.unionByName(frontier_dn)
+
+# Normalize UPSTREAM/DOWNSTREAM to a single edge set (with direction)
+tbl_up_norm = (edges_tbl_up
+  .withColumn("direction", F.lit("UPSTREAM"))
+  .withColumn("source_table", F.col("parent_table"))
+  .withColumn("target_table", F.col("child_table"))
+  .drop("parent_table","child_table")
+)
+tbl_dn_norm = (edges_tbl_dn
+  .withColumn("direction", F.lit("DOWNSTREAM"))
+  .withColumn("source_table", F.col("parent_table"))
+  .withColumn("target_table", F.col("child_table"))
+  .drop("parent_table","child_table")
+)
+df_table_lineage_bidir = (tbl_up_norm.unionByName(tbl_dn_norm, allowMissingColumns=True)
+  .orderBy("direction","hop","source_table","target_table")
+  .persist(StorageLevel.MEMORY_AND_DISK)
+)
+
+# =========================
+# COLUMN lineage — UPSTREAM BFS (target -> source)
+# =========================
+start_up_cols = (
+    column_lineage.where(F.col("target_table_full_name")==BASE_FQN)
+    .select(
+        F.col("target_table_full_name").alias("child_table"),
+        F.col("target_column_name").alias("child_column"),
+        F.col("source_table_full_name").alias("parent_table"),
+        F.col("source_column_name").alias("parent_column"),
+        F.lit(1).alias("hop"),
+        "source_type","target_type","event_time","created_by",
+        "entity_type","entity_id","entity_run_id"
+    ).dropDuplicates(["child_table","child_column","parent_table","parent_column","event_time"])
+)
+edges_col_up = start_up_cols
+frontier_up_cols = (
+    start_up_cols
+    .select(F.col("parent_table").alias("t"), F.col("parent_column").alias("c"), "hop")
+    .where(F.col("t").isNotNull() & F.col("c").isNotNull())
+    .dropDuplicates(["t","c"])
+)
+for _i in range(2, MAX_HOPS+1):
+    if frontier_up_cols.rdd.isEmpty(): break
+    step = (
+        column_lineage.alias("cl")
+        .join(F.broadcast(frontier_up_cols.alias("fc")),
+              (F.col("cl.target_table_full_name")==F.col("fc.t")) &
+              (F.col("cl.target_column_name")==F.col("fc.c")), "inner")
+        .select(
+            F.col("cl.target_table_full_name").alias("child_table"),
+            F.col("cl.target_column_name").alias("child_column"),
+            F.col("cl.source_table_full_name").alias("parent_table"),
+            F.col("cl.source_column_name").alias("parent_column"),
+            (F.col("fc.hop")+F.lit(1)).alias("hop"),
+            F.col("cl.source_type"), F.col("cl.target_type"),
+            F.col("cl.event_time"), F.col("cl.created_by"),
+            F.col("cl.entity_type"), F.col("cl.entity_id"), F.col("cl.entity_run_id")
+        ).dropDuplicates(["child_table","child_column","parent_table","parent_column","event_time"])
+    )
+    edges_col_up = edges_col_up.unionByName(step, allowMissingColumns=True)
+    frontier_up_cols = (
+        step.where(F.col("parent_table").isNotNull() & F.col("parent_column").isNotNull())
+            .select(F.col("parent_table").alias("t"), F.col("parent_column").alias("c"), "hop")
+            .dropDuplicates(["t","c"])
+    )
+
+# =========================
+# COLUMN lineage — DOWNSTREAM BFS (source -> target)
+# =========================
+start_dn_cols = (
+    column_lineage.where(F.col("source_table_full_name")==BASE_FQN)
+    .select(
+        F.col("target_table_full_name").alias("child_table"),
+        F.col("target_column_name").alias("child_column"),
+        F.col("source_table_full_name").alias("parent_table"),
+        F.col("source_column_name").alias("parent_column"),
+        F.lit(1).alias("hop"),
+        "source_type","target_type","event_time","created_by",
+        "entity_type","entity_id","entity_run_id"
+    ).dropDuplicates(["child_table","child_column","parent_table","parent_column","event_time"])
+)
+edges_col_dn = start_dn_cols
+frontier_dn_cols = (
+    start_dn_cols
+    .select(F.col("child_table").alias("t"), F.col("child_column").alias("c"), "hop")
+    .where(F.col("t").isNotNull() & F.col("c").isNotNull())
+    .dropDuplicates(["t","c"])
+)
+for _i in range(2, MAX_HOPS+1):
+    if frontier_dn_cols.rdd.isEmpty(): break
+    step = (
+        column_lineage.alias("cl")
+        .join(F.broadcast(frontier_dn_cols.alias("fc")),
+              (F.col("cl.source_table_full_name")==F.col("fc.t")) &
+              (F.col("cl.source_column_name")==F.col("fc.c")), "inner")
+        .select(
+            F.col("cl.target_table_full_name").alias("child_table"),
+            F.col("cl.target_column_name").alias("child_column"),
+            F.col("cl.source_table_full_name").alias("parent_table"),
+            F.col("cl.source_column_name").alias("parent_column"),
+            (F.col("fc.hop")+F.lit(1)).alias("hop"),
+            F.col("cl.source_type"), F.col("cl.target_type"),
+            F.col("cl.event_time"), F.col("cl.created_by"),
+            F.col("cl.entity_type"), F.col("cl.entity_id"), F.col("cl.entity_run_id")
+        ).dropDuplicates(["child_table","child_column","parent_table","parent_column","event_time"])
+    )
+    edges_col_dn = edges_col_dn.unionByName(step, allowMissingColumns=True)
+    frontier_dn_cols = (
+        step.where(F.col("child_table").isNotNull() & F.col("child_column").isNotNull())
+            .select(F.col("child_table").alias("t"), F.col("child_column").alias("c"), "hop")
+            .dropDuplicates(["t","c"])
+    )
+
+# Normalize column edges
+col_up_norm = (edges_col_up
+  .withColumn("direction", F.lit("UPSTREAM"))
+  .withColumn("source_table",  F.col("parent_table"))
+  .withColumn("source_column", F.col("parent_column"))
+  .withColumn("target_table",  F.col("child_table"))
+  .withColumn("target_column", F.col("child_column"))
+  .drop("parent_table","parent_column","child_table","child_column")
+)
+col_dn_norm = (edges_col_dn
+  .withColumn("direction", F.lit("DOWNSTREAM"))
+  .withColumn("source_table",  F.col("parent_table"))
+  .withColumn("source_column", F.col("parent_column"))
+  .withColumn("target_table",  F.col("child_table"))
+  .withColumn("target_column", F.col("child_column"))
+  .drop("parent_table","parent_column","child_table","child_column")
+)
+df_column_lineage_bidir = (col_up_norm.unionByName(col_dn_norm, allowMissingColumns=True)
+  .orderBy("direction","hop","source_table","source_column","target_table","target_column")
+  .persist(StorageLevel.MEMORY_AND_DISK)
+)
+
+# =========================
+# MASK unknown/NULL objects & columns (never hide them)
+# =========================
+# Table masks
+src_mask_key = mask_name_col(
+    "SRC",
+    ["entity_id","entity_run_id","created_by","source_type","target_type", F.date_format(F.col("event_time"), "yyyy-MM-dd HH:mm:ss").alias("event_time_str")._jc.toString()],
+    "Masked_Object_"
+)  # key expr only; label added after rank mapping
+
+tgt_mask_key = mask_name_col(
+    "TGT",
+    ["entity_id","entity_run_id","created_by","source_type","target_type", F.date_format(F.col("event_time"), "yyyy-MM-dd HH:mm:ss").alias("event_time_str")._jc.toString()],
+    "Masked_Object_"
+)
+
+df_table_lineage_bidir = (
+    df_table_lineage_bidir
+    .withColumn("src_mask_key", F.when(F.col("source_table").isNull(), 
+        F.sha2(F.concat_ws("|", F.lit("SRC"),
+            F.coalesce(F.col("entity_id"), F.lit("")),
+            F.coalesce(F.col("entity_run_id"), F.lit("")),
+            F.coalesce(F.col("created_by"), F.lit("")),
+            F.coalesce(F.col("source_type"), F.lit("")),
+            F.coalesce(F.col("target_type"), F.lit("")),
+            F.coalesce(F.date_format(F.col("event_time"), "yyyy-MM-dd HH:mm:ss"), F.lit(""))
+        ), 256)
+    ))
+    .withColumn("tgt_mask_key", F.when(F.col("target_table").isNull(), 
+        F.sha2(F.concat_ws("|", F.lit("TGT"),
+            F.coalesce(F.col("entity_id"), F.lit("")),
+            F.coalesce(F.col("entity_run_id"), F.lit("")),
+            F.coalesce(F.col("created_by"), F.lit("")),
+            F.coalesce(F.col("source_type"), F.lit("")),
+            F.coalesce(F.col("target_type"), F.lit("")),
+            F.coalesce(F.date_format(F.col("event_time"), "yyyy-MM-dd HH:mm:ss"), F.lit(""))
+        ), 256)
+    ))
+)
+
+mask_keys_tbl = (
+    df_table_lineage_bidir
+    .select(F.col("src_mask_key").alias("mask_key")).where(F.col("mask_key").isNotNull())
+    .union(df_table_lineage_bidir.select(F.col("tgt_mask_key").alias("mask_key")).where(F.col("mask_key").isNotNull()))
+    .distinct()
+)
+
+w = Window.orderBy("mask_key")
+mask_map_tbl = (
+    mask_keys_tbl
+    .withColumn("mask_idx", F.dense_rank().over(w) - 1)
+    .withColumn("mask_label", F.concat(F.lit("Masked_Object_"), F.col("mask_idx")))
+)
+
+df_table_lineage_bidir = (
+    df_table_lineage_bidir
+    .join(mask_map_tbl.withColumnRenamed("mask_key","src_mask_key").withColumnRenamed("mask_label","src_mask_label"), "src_mask_key", "left")
+    .join(mask_map_tbl.withColumnRenamed("mask_key","tgt_mask_key").withColumnRenamed("mask_label","tgt_mask_label"), "tgt_mask_key", "left")
+    .withColumn("source_is_masked", F.col("src_mask_label").isNotNull())
+    .withColumn("target_is_masked", F.col("tgt_mask_label").isNotNull())
+    .withColumn("source_table", F.when(F.col("source_table").isNull(), F.col("src_mask_label")).otherwise(F.col("source_table")))
+    .withColumn("target_table", F.when(F.col("target_table").isNull(), F.col("tgt_mask_label")).otherwise(F.col("target_table")))
+    .drop("src_mask_key","tgt_mask_key","src_mask_label","tgt_mask_label")
+)
+
+# Column masks
+df_column_lineage_bidir = (
+    df_column_lineage_bidir
+    .withColumn("src_col_mask_key", F.when(F.col("source_column").isNull(),
+        F.sha2(F.concat_ws("|", F.lit("COLSRC"),
+            F.coalesce(F.col("entity_id"), F.lit("")),
+            F.coalesce(F.col("entity_run_id"), F.lit("")),
+            F.coalesce(F.col("created_by"), F.lit("")),
+            F.coalesce(F.col("source_type"), F.lit("")),
+            F.coalesce(F.col("target_type"), F.lit("")),
+            F.coalesce(F.date_format(F.col("event_time"), "yyyy-MM-dd HH:mm:ss"), F.lit(""))
+        ), 256)
+    ))
+    .withColumn("tgt_col_mask_key", F.when(F.col("target_column").isNull(),
+        F.sha2(F.concat_ws("|", F.lit("COLTGT"),
+            F.coalesce(F.col("entity_id"), F.lit("")),
+            F.coalesce(F.col("entity_run_id"), F.lit("")),
+            F.coalesce(F.col("created_by"), F.lit("")),
+            F.coalesce(F.col("source_type"), F.lit("")),
+            F.coalesce(F.col("target_type"), F.lit("")),
+            F.coalesce(F.date_format(F.col("event_time"), "yyyy-MM-dd HH:mm:ss"), F.lit(""))
+        ), 256)
+    ))
+)
+
+mask_keys_col = (
+    df_column_lineage_bidir
+    .select(F.col("src_col_mask_key").alias("mask_key")).where(F.col("mask_key").isNotNull())
+    .union(df_column_lineage_bidir.select(F.col("tgt_col_mask_key").alias("mask_key")).where(F.col("mask_key").isNotNull()))
+    .distinct()
+)
+mask_map_col = (
+    mask_keys_col
+    .withColumn("mask_idx", F.dense_rank().over(w) - 1)
+    .withColumn("mask_label", F.concat(F.lit("Masked_Column_"), F.col("mask_idx")))
+)
+df_column_lineage_bidir = (
+    df_column_lineage_bidir
+    .join(mask_map_col.withColumnRenamed("mask_key","src_col_mask_key").withColumnRenamed("mask_label","src_col_mask_label"), "src_col_mask_key", "left")
+    .join(mask_map_col.withColumnRenamed("mask_key","tgt_col_mask_key").withColumnRenamed("mask_label","tgt_col_mask_label"), "tgt_col_mask_key", "left")
+    .withColumn("source_column_is_masked", F.col("src_col_mask_label").isNotNull())
+    .withColumn("target_column_is_masked", F.col("tgt_col_mask_label").isNotNull())
+    .withColumn("source_column", F.when(F.col("source_column").isNull(), F.col("src_col_mask_label")).otherwise(F.col("source_column")))
+    .withColumn("target_column", F.when(F.col("target_column").isNull(), F.col("tgt_col_mask_label")).otherwise(F.col("target_column")))
+    .drop("src_col_mask_key","tgt_col_mask_key","src_col_mask_label","tgt_col_mask_label")
+)
+
+# =========================
+# Enrichment: table types / view SQL / last *data* update
+# =========================
+tbl_info  = info_schema_tables_df()
+view_info = info_schema_views_df()
+
+# lineage-derived last write (fast path)
+last_write_from_lineage = (
+    lineage_table
+    .where(F.col("target_table_full_name").isNotNull())
+    .groupBy(F.col("target_table_full_name").alias("table_full_name"))
+    .agg(F.max("event_time").alias("lineage_last_write_ts"))
+)
+
+# discovered tables for history fallback
+discovered_tables = (
+    df_table_lineage_bidir
+    .select("source_table").union(df_table_lineage_bidir.select("target_table"))
+    .where(F.col("source_table").rlike(r'^[^.]+\.[^.]+\.[^.]+$') | F.col("target_table").rlike(r'^[^.]+\.[^.]+\.[^.]+$'))
+    .select(F.coalesce("source_table","target_table").alias("t"))
+    .distinct()
+    .collect()
+)
+table_list = [r.t for r in discovered_tables] + [BASE_FQN]
+history_updates = last_data_update_from_history(table_list)
+
+last_update = (
+    last_write_from_lineage.join(history_updates, "table_full_name", "full")
+    .select(
+        "table_full_name",
+        F.greatest("lineage_last_write_ts","history_ts").alias("last_data_update_ts"),
+        F.when(F.col("history_op").isNotNull(), F.col("history_op"))
+         .when(F.col("lineage_last_write_ts").isNotNull(), F.lit("LINEAGE_WRITE"))
+         .otherwise(F.lit(None)).alias("last_data_update_op")
+    )
+)
+
+# Safe FQN splits (only for true 3-part names)
+src_cat, src_sch, src_nam = safe_split_fqn("source_table")
+tgt_cat, tgt_sch, tgt_nam = safe_split_fqn("target_table")
+
+# ----- TABLE EDGES enriched -----
+df_table_lineage_bidir = (
+    df_table_lineage_bidir
+    .withColumns({"src_catalog": src_cat, "src_schema": src_sch, "src_name": src_nam,
+                  "tgt_catalog": tgt_cat, "tgt_schema": tgt_sch, "tgt_name": tgt_nam})
+    # table types
+    .join(tbl_info.alias("tis"),
+          (F.col("tis.catalog")==F.lower("src_catalog")) &
+          (F.col("tis.schema")==F.lower("src_schema")) &
+          (F.col("tis.table")==F.col("src_name")), "left")
+    .withColumnRenamed("table_type","source_table_type") \
+    .withColumnRenamed("last_altered","source_last_altered") \
+    .join(tbl_info.alias("tit"),
+          (F.col("tit.catalog")==F.lower("tgt_catalog")) &
+          (F.col("tit.schema")==F.lower("tgt_schema")) &
+          (F.col("tit.table")==F.col("tgt_name")), "left")
+    .withColumnRenamed("table_type","target_table_type") \
+    .withColumnRenamed("last_altered","target_last_altered")
+    # view SQL
+    .join(view_info.alias("vis"),
+          (F.col("vis.catalog")==F.lower("src_catalog")) &
+          (F.col("vis.schema")==F.lower("src_schema")) &
+          (F.col("vis.table")==F.col("src_name")), "left")
+    .withColumnRenamed("view_definition","source_view_definition")
+    .join(view_info.alias("vit"),
+          (F.col("vit.catalog")==F.lower("tgt_catalog")) &
+          (F.col("vit.schema")==F.lower("tgt_schema")) &
+          (F.col("vit.table")==F.col("tgt_name")), "left")
+    .withColumnRenamed("view_definition","target_view_definition")
+    # last data update
+    .join(last_update.select(F.col("table_full_name").alias("source_table"),
+                             F.col("last_data_update_ts").alias("source_last_data_update_ts"),
+                             F.col("last_data_update_op").alias("source_last_data_update_op")), "source_table","left")
+    .join(last_update.select(F.col("table_full_name").alias("target_table"),
+                             F.col("last_data_update_ts").alias("target_last_data_update_ts"),
+                             F.col("last_data_update_op").alias("target_last_data_update_op")), "target_table","left")
+    .select(
+        "direction","hop",
+        "source_table","source_is_masked","source_table_type","source_last_altered","source_view_definition",
+        "target_table","target_is_masked","target_table_type","target_last_altered","target_view_definition",
+        "source_type","target_type","event_time","created_by",
+        "entity_type","entity_id","entity_run_id",
+        "source_last_data_update_ts","source_last_data_update_op",
+        "target_last_data_update_ts","target_last_data_update_op"
+    )
+    .orderBy("direction","hop","source_table","target_table")
+    .persist(StorageLevel.MEMORY_AND_DISK)
+)
+
+# ----- COLUMN EDGES enriched -----
+df_column_lineage_bidir = (
+    df_column_lineage_bidir
+    .withColumns({"src_catalog": src_cat, "src_schema": src_sch, "src_name": src_nam,
+                  "tgt_catalog": tgt_cat, "tgt_schema": tgt_sch, "tgt_name": tgt_nam})
+    # table types for context
+    .join(tbl_info.alias("tis"),
+          (F.col("tis.catalog")==F.lower("src_catalog")) &
+          (F.col("tis.schema")==F.lower("src_schema")) &
+          (F.col("tis.table")==F.col("src_name")), "left")
+    .withColumnRenamed("table_type","source_table_type")
+    .join(tbl_info.alias("tit"),
+          (F.col("tit.catalog")==F.lower("tgt_catalog")) &
+          (F.col("tit.schema")==F.lower("tgt_schema")) &
+          (F.col("tit.table")==F.col("tgt_name")), "left")
+    .withColumnRenamed("table_type","target_table_type")
+    # last data update to parent/child tables (useful at column granularity)
+    .join(last_update.select(F.col("table_full_name").alias("source_table"),
+                             F.col("last_data_update_ts").alias("source_last_data_update_ts"),
+                             F.col("last_data_update_op").alias("source_last_data_update_op")), "source_table","left")
+    .join(last_update.select(F.col("table_full_name").alias("target_table"),
+                             F.col("last_data_update_ts").alias("target_last_data_update_ts"),
+                             F.col("last_data_update_op").alias("target_last_data_update_op")), "target_table","left")
+    .select(
+        "direction","hop",
+        "source_table","source_is_masked","source_table_type","source_last_data_update_ts","source_last_data_update_op",
+        "source_column","source_column_is_masked",
+        "target_table","target_is_masked","target_table_type","target_last_data_update_ts","target_last_data_update_op",
+        "target_column","target_column_is_masked",
+        "source_type","target_type","event_time","created_by",
+        "entity_type","entity_id","entity_run_id"
+    )
+    .orderBy("direction","hop","source_table","source_column","target_table","target_column")
+    .persist(StorageLevel.MEMORY_AND_DISK)
+)
+
+# =========================
+# Graph tables (nested)
+# =========================
+df_table_graph_up = (
+    df_table_lineage_bidir.where(F.col("direction")=="UPSTREAM")
+    .groupBy("target_table")
+    .agg(
+        F.sort_array(F.collect_list(F.struct(
+            "hop",
+            F.col("source_table").alias("upstream_source_table"),
+            "source_is_masked","source_table_type",
+            "source_last_data_update_ts","source_last_data_update_op",
+            "event_time","created_by","entity_type","entity_id","entity_run_id"
+        )), asc=True).alias("upstream")
+    )
+    .orderBy("target_table")
+    .persist(StorageLevel.MEMORY_AND_DISK)
+)
+
+df_table_graph_down = (
+    df_table_lineage_bidir.where(F.col("direction")=="DOWNSTREAM")
+    .groupBy("source_table")
+    .agg(
+        F.sort_array(F.collect_list(F.struct(
+            "hop",
+            F.col("target_table").alias("downstream_target_table"),
+            "target_is_masked","target_table_type",
+            "target_last_data_update_ts","target_last_data_update_op",
+            "event_time","created_by","entity_type","entity_id","entity_run_id"
+        )), asc=True).alias("downstream")
+    )
+    .orderBy("source_table")
+    .persist(StorageLevel.MEMORY_AND_DISK)
+)
+
+df_column_graph_up = (
+    df_column_lineage_bidir.where(F.col("direction")=="UPSTREAM")
+    .groupBy("target_table","target_column")
+    .agg(
+        F.sort_array(F.collect_list(F.struct(
+            "hop",
+            F.col("source_table").alias("upstream_source_table"),
+            F.col("source_column").alias("upstream_source_column"),
+            "source_is_masked","source_column_is_masked","source_table_type",
+            "source_last_data_update_ts","source_last_data_update_op",
+            "event_time","created_by","entity_type","entity_id","entity_run_id"
+        )), asc=True).alias("upstream")
+    )
+    .orderBy("target_table","target_column")
+    .persist(StorageLevel.MEMORY_AND_DISK)
+)
+
+df_column_graph_down = (
+    df_column_lineage_bidir.where(F.col("direction")=="DOWNSTREAM")
+    .groupBy("source_table","source_column")
+    .agg(
+        F.sort_array(F.collect_list(F.struct(
+            "hop",
+            F.col("target_table").alias("downstream_target_table"),
+            F.col("target_column").alias("downstream_target_column"),
+            "target_is_masked","target_column_is_masked","target_table_type",
+            "target_last_data_update_ts","target_last_data_update_op",
+            "event_time","created_by","entity_type","entity_id","entity_run_id"
+        )), asc=True).alias("downstream")
+    )
+    .orderBy("source_table","source_column")
+    .persist(StorageLevel.MEMORY_AND_DISK)
+)
+
+# =========================
+# Display (Databricks)
+# =========================
+display(df_table_lineage_bidir)
+display(df_column_lineage_bidir)
+display(df_table_graph_up)
+display(df_table_graph_down)
+display(df_column_graph_up)
+display(df_column_graph_down)
+
+# =========================
+# Save Delta tables (optional)
+# =========================
+if SAVE_OUTPUTS:
+    for full in [OUT_TBL_TABLE_EDGES, OUT_TBL_COLUMN_EDGES, OUT_TBL_TGRAPH_UP, OUT_TBL_TGRAPH_DOWN, OUT_TBL_CGRAPH_UP, OUT_TBL_CGRAPH_DOWN]:
+        create_schema_if_needed(full)
+    (df_table_lineage_bidir.write.mode("overwrite").option("overwriteSchema","true").saveAsTable(OUT_TBL_TABLE_EDGES))
+    (df_column_lineage_bidir.write.mode("overwrite").option("overwriteSchema","true").saveAsTable(OUT_TBL_COLUMN_EDGES))
+    (df_table_graph_up.write.mode("overwrite").option("overwriteSchema","true").saveAsTable(OUT_TBL_TGRAPH_UP))
+    (df_table_graph_down.write.mode("overwrite").option("overwriteSchema","true").saveAsTable(OUT_TBL_TGRAPH_DOWN))
+    (df_column_graph_up.write.mode("overwrite").option("overwriteSchema","true").saveAsTable(OUT_TBL_CGRAPH_UP))
+    (df_column_graph_down.write.mode("overwrite").option("overwriteSchema","true").saveAsTable(OUT_TBL_CGRAPH_DOWN))
+    print("Saved lineage outputs.")
+
+# =========================
+# File exports to UC Volume (optional)
+# =========================
+if EXPORT_FILES:
+    import datetime as dt, os
+    run_id    = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    sparkBase = f"dbfs:{VOLUME_BASE_PATH.rstrip('/')}/{run_id}"
+    localBase = f"/dbfs{VOLUME_BASE_PATH.rstrip('/')}/{run_id}"
+    write_df(df_table_lineage_bidir,  EXPORT_FORMAT, f"{sparkBase}/table_edges_bidir",  EXPORT_COALESCE)
+    write_df(df_column_lineage_bidir, EXPORT_FORMAT, f"{sparkBase}/column_edges_bidir", EXPORT_COALESCE)
+    print(f"Exported edges to {sparkBase}")
+
+    if WRITE_GRAPHML:
+        try:
+            import networkx as nx
+            os.makedirs(localBase, exist_ok=True)
+            tbl_pd = df_table_lineage_bidir.select("source_table","target_table","hop").limit(GRAPHML_EDGE_LIMIT).toPandas()
+            Gt = nx.DiGraph()
+            for r in tbl_pd.itertuples(index=False):
+                Gt.add_edge(r.source_table, r.target_table, hop=int(r.hop))
+            nx.write_graphml(Gt, f"{localBase}/table_lineage.graphml")
+
+            col_pd = (
+                df_column_lineage_bidir
+                .select(F.concat_ws(".", "source_table","source_column").alias("src"),
+                        F.concat_ws(".", "target_table","target_column").alias("tgt"),
+                        "hop")
+                .limit(GRAPHML_EDGE_LIMIT).toPandas()
+            )
+            Gc = nx.DiGraph()
+            for r in col_pd.itertuples(index=False):
+                Gc.add_edge(r.src, r.tgt, hop=int(r.hop))
+            nx.write_graphml(Gc, f"{localBase}/column_lineage.graphml")
+            print(f"GraphML written under dbfs:{VOLUME_BASE_PATH.rstrip('/')}/{run_id}")
+        except Exception as e:
+            print(f"GraphML export skipped: {e}")
